@@ -1,0 +1,4 @@
+IMU_doc/
+.claude/
+__pycache__/
+python_embed/
