@@ -8,7 +8,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "exo_records.xlsx")
 
 COLUMNS = [
     "record_id", "subject_name", "gender", "age", "height_cm", "weight_kg",
-    "spring_k", "task_type", "condition", "timestamp",
+    "patient_kg", "spring_k", "task_type", "condition", "timestamp",
     "theta_deg", "M_lumbar", "M_exo", "M_mus_exo",
     "F_c_bare", "F_c_exo", "reduction_percent", "load_index", "risk_flag",
 ]
@@ -20,6 +20,7 @@ COLUMN_LABELS = {
     "age": "年齡",
     "height_cm": "身高(cm)",
     "weight_kg": "體重(kg)",
+    "patient_kg": "老人重量(kg)",
     "spring_k": "彈簧係數",
     "task_type": "任務類型",
     "condition": "條件",

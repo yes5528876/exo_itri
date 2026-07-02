@@ -2,3 +2,12 @@ IMU_doc/
 .claude/
 __pycache__/
 python_embed/
+
+# Data / DB files (auto-generated at runtime or archived experiment output)
+*.xlsx
+
+# LibreOffice lock files
+.~lock.*
+
+# Temp text dumps from docx extraction
+doc_full.txt

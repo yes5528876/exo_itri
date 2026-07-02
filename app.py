@@ -92,6 +92,8 @@ with st.sidebar:
     age = st.number_input("年齡", 10, 100, 30)
     height_cm = st.number_input("身高 (cm)", 100.0, 220.0, 170.0, step=0.5)
     weight_kg = st.number_input("體重 (kg)", 30.0, 150.0, 65.0, step=0.5)
+    patient_kg = st.number_input("老人重量 (kg)", 0.0, 150.0, 60.0, step=0.5,
+                                  help="搬運/移床的老人體重，計入腰椎負載：W_upper = 體重×0.6 + 老人重量")
     spring_k = st.number_input("彈簧係數 k (Nm/deg)", 0.0, 5.0, 0.5, step=0.05,
                                 help="被動式彈簧外骨骼: M_exo = k × θ")
     task_type = st.selectbox("任務類型", ["擺位", "移床"])
@@ -216,6 +218,7 @@ subject_info = {
     "age": age,
     "height_cm": height_cm,
     "weight_kg": weight_kg,
+    "patient_kg": patient_kg,
     "spring_k": spring_k,
     "task_type": task_type,
     "condition": condition_val,
@@ -239,7 +242,7 @@ else:
     using_real_imu = False
 
 theta_calibrated = max(0.0, theta_raw - st.session_state.theta_offset)
-metrics = compute_all(theta_calibrated, weight_kg, spring_k, condition_val)
+metrics = compute_all(theta_calibrated, weight_kg, spring_k, condition_val, load_kg=patient_kg)
 
 # ── Main layout ──────────────────────────────────────────────────────────────
 st.markdown("# 🦴 外骨骼輔助人機介面")
