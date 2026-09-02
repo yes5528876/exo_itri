@@ -114,7 +114,7 @@ with st.sidebar:
     # ── IMU 1 (軀幹) ──
     st.markdown("**IMU 1 — 軀幹 (θ1)**")
     sel1 = st.selectbox("", device_options, key="sel_imu1", label_visibility="collapsed")
-    addr1 = st.text_input("MAC 地址", value="EA:8A:1B:4A:C6:63", key="addr_imu1")
+    addr1 = st.text_input("MAC 地址", value="DC:D2:5D:E8:79:BD", key="addr_imu1")
     addr_trunk = addr1 if sel1 == "(手動輸入)" else sel1.split()[-1]
 
     mgr: DualIMUManager | None = st.session_state.imu_manager
@@ -157,7 +157,7 @@ with st.sidebar:
     # ── IMU 2 (骨盆) ──
     st.markdown("**IMU 2 — 骨盆 (θ2)**")
     sel2 = st.selectbox("", device_options, key="sel_imu2", label_visibility="collapsed")
-    addr2 = st.text_input("MAC 地址", value="DC:D2:5D:E8:79:BD", key="addr_imu2")
+    addr2 = st.text_input("MAC 地址", value="EA:8A:1B:4A:C6:63", key="addr_imu2")
     addr_pelvis = addr2 if sel2 == "(手動輸入)" else sel2.split()[-1]
 
     imu2 = mgr.imu_pelvis if mgr else None

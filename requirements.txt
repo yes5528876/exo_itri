@@ -1,3 +1,10 @@
+# 核心執行(跑 app.py 必需)
 streamlit>=1.35.0
 openpyxl>=3.1.0
 pandas>=2.0.0
+bleak>=0.22.0          # BLE 連接 WT901BLE IMU
+
+# 選用:重新產生 Word 規格書時才需要(gen_rewrite.py / gen_figures.py)
+# python-docx>=1.1.0
+# matplotlib>=3.8.0
+# pillow>=10.0.0
