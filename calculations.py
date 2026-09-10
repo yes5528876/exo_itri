@@ -26,6 +26,8 @@ D_COM           = 0.30   # m,     upper-body COM to L5-S1  (lit. range 0.25–0.
 D_MUS           = 0.05   # m,     erector spinae moment arm (lit. range 0.04–0.06)
 UPPER_BODY_RATIO = 0.60  # —,     upper-body mass fraction  (lit. range 0.55–0.67)
 NIOSH_LIMIT     = 3400   # N,     NIOSH L5-S1 injury threshold
+LEAN_BACK_DEG   = -2.0   # deg,   measured angle below this = leaning back (clear of
+                         #        normal standing sway); highlighted on screen and in Excel
 
 
 # ── Core biomechanical calculations ──────────────────────────────────────────
@@ -117,11 +119,17 @@ def compute_all(theta_deg: float, weight_kg: float, spring_k: float,
     """Compute all biomechanical metrics for the current frame.
 
     Args:
-        theta_deg : calibrated trunk flexion angle [deg]
+        theta_deg : calibrated trunk angle as measured [deg]; negative = leaning back
         weight_kg : subject body weight [kg]
         spring_k  : passive spring stiffness [Nm/deg]
         condition : 'bare' or 'exo'
         load_kg   : mass of any held object [kg], default 0
+
+    Negative angles go straight into the formulas (by choice: such rows are
+    flagged via LEAN_BACK_DEG instead of clamped). The single-muscle model only
+    covers forward flexion, so leaning back gives a negative M_lumbar and an
+    F_c_bare below standing weight that turns negative past about -9.5 deg
+    (tan θ = -D_MUS/D_COM); F_c_exo stays at W_upper·g·cos θ.
 
     Returns dict with keys:
         theta_deg, M_lumbar, M_exo, M_mus_exo,
