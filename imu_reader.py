@@ -46,13 +46,23 @@ PKT_ACC   = 0x51
 PKT_GYRO  = 0x52
 SERIAL_PKT_LEN = 11
 
+# Link supervision
+CONNECT_TIMEOUT_S = 10.0   # per connection attempt
+DATA_TIMEOUT_S    = 3.0    # no packet for this long -> treat the link as dead
+RECONNECT_DELAY_S = 2.0    # pause between reconnect attempts
+
 
 def _s16(lo: int, hi: int) -> int:
     return struct.unpack('h', bytes([lo, hi]))[0]
 
 
 class IMUReader:
-    """Single BLE IMU reader. Call start() to connect, stop() to disconnect."""
+    """Single BLE IMU reader. Call start_async() to connect, stop() to disconnect.
+
+    Once connected, a dropped link (OS disconnect event, or no data for
+    DATA_TIMEOUT_S) is reconnected automatically until stop() is called.
+    A failed *first* connection is reported via error_msg and not retried.
+    """
 
     def __init__(self, address: str, label: str = "IMU"):
         self.address = address
@@ -64,11 +74,23 @@ class IMUReader:
         self.ax = self.ay = self.az = 0.0
         self.wx = self.wy = self.wz = 0.0
 
-        self.connected   = False
-        self.connecting  = False
-        self.error_msg   = ""
-        self.last_update = 0.0
+        self.connected    = False
+        self.connecting   = False   # first connection attempt in progress
+        self.reconnecting = False   # link dropped, auto-reconnect in progress
+        self.error_msg    = ""
+        self.last_update  = 0.0
 
+        # Link-drop history, read by the UI to raise alerts
+        self.disconnect_count       = 0    # unexpected drops since start
+        self.reconnect_count        = 0    # successful automatic reconnects
+        self.reconnect_attempts     = 0    # attempts since the latest drop
+        self.last_disconnect_time   = 0.0
+        self.last_disconnect_reason = ""
+        self.last_reconnect_time    = 0.0
+
+        self._ever_connected = False
+        self._link_lost      = False   # set by bleak's disconnected_callback
+        self._stream_start   = 0.0     # watchdog baseline for the current link
         self._buf = bytearray()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -78,14 +100,15 @@ class IMUReader:
     # ── Public API ────────────────────────────────────────────────────────────
     def start_async(self):
         """Non-blocking: start BLE thread immediately and return.
-        Poll .connected / .error_msg / .connecting to check status."""
+        Poll .connected / .connecting / .reconnecting / .error_msg for status."""
         if not BLEAK_AVAILABLE:
             self.error_msg = "bleak not installed"
             return
         self._stop_event.clear()
-        self.connected  = False
-        self.connecting = True
-        self.error_msg  = ""
+        self.connected    = False
+        self.connecting   = True
+        self.reconnecting = False
+        self.error_msg    = ""
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
@@ -99,16 +122,24 @@ class IMUReader:
         return self.connected
 
     def stop(self):
+        """Stop streaming and reconnecting. Waits up to 3 s for the thread; a
+        connect attempt already in flight finishes on its own, then disconnects."""
         self._stop_event.set()
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
-            self._thread.join(timeout=5)
-        self.connected = False
+            self._thread.join(timeout=3)
+        self.connected    = False
+        self.connecting   = False
+        self.reconnecting = False
 
     @property
     def stale(self) -> bool:
         return (time.time() - self.last_update) > 2.0
+
+    @property
+    def active(self) -> bool:
+        """Reader thread is alive: connected, connecting or reconnecting."""
+        return bool(self._thread and self._thread.is_alive()
+                    and not self._stop_event.is_set())
 
     # ── Thread + async loop ───────────────────────────────────────────────────
     def _thread_main(self):
@@ -117,35 +148,103 @@ class IMUReader:
         try:
             self._loop.run_until_complete(self._ble_main())
         except Exception as e:
-            import traceback
-            self.error_msg = f"{e}\n{traceback.format_exc()}"
-            self.connected = False
+            logger.exception("%s: reader thread crashed", self.label)
+            self.error_msg = f"{type(e).__name__}: {e}"
         finally:
+            self.connected    = False
+            self.connecting   = False
+            self.reconnecting = False
             try:
                 self._loop.close()
             except Exception:
                 pass
 
     async def _ble_main(self):
+        """Supervise the link: after a drop, keep reconnecting until stop()."""
+        while not self._stop_event.is_set():
+            if self.reconnecting:
+                self.reconnect_attempts += 1
+            try:
+                await self._run_session()
+            except Exception as e:
+                self.error_msg = f"{type(e).__name__}: {e}"
+                if not self._ever_connected:
+                    logger.warning("%s: connect failed: %s", self.label, self.error_msg)
+                    return  # first connection failed: report it, don't retry
+                if self.reconnecting:
+                    logger.info("%s: reconnect attempt %d failed: %s",
+                                self.label, self.reconnect_attempts, self.error_msg)
+                else:       # the live session itself failed
+                    self._on_dropped(self.error_msg)
+            await self._sleep_unless_stopped(RECONNECT_DELAY_S)
+
+    async def _run_session(self):
+        """One connection lifetime: connect, stream until the link drops or
+        stop() is requested, then disconnect. Raises if connecting fails."""
+        self._link_lost = False
+        with self._lock:
+            self._buf.clear()   # drop any partial packet from the previous link
+        client = BleakClient(self.address, disconnected_callback=self._on_link_lost,
+                             timeout=CONNECT_TIMEOUT_S)
+        await client.connect()
         try:
-            async with BleakClient(self.address, timeout=10.0) as client:
-                self.connected  = True
-                self.connecting = False
-                self.error_msg  = ""
-                logger.info(f"{self.label}: connected to {self.address}")
-
-                await client.start_notify(UUID_NOTIFY, self._on_data)
-
-                while not self._stop_event.is_set():
-                    await asyncio.sleep(0.05)
-
-                await client.stop_notify(UUID_NOTIFY)
-
-        except Exception as e:
-            import traceback
-            self.error_msg = f"{e}\n{traceback.format_exc()}"
+            if self._stop_event.is_set():
+                return
+            await client.start_notify(UUID_NOTIFY, self._on_data)
+            self._on_connected()
+            reason = await self._watch_link(client)
+            if reason:
+                self._on_dropped(reason)
+        finally:
             self.connected = False
-            self.connecting = False
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=5.0)
+            except Exception:
+                pass
+
+    async def _watch_link(self, client) -> str | None:
+        """Block while the link is healthy; return why it dropped, or None on stop()."""
+        while not self._stop_event.is_set():
+            if self._link_lost or not client.is_connected:
+                return "藍牙連線中斷"
+            if time.time() - max(self.last_update, self._stream_start) > DATA_TIMEOUT_S:
+                return f"超過 {DATA_TIMEOUT_S:.0f} 秒未收到資料"
+            await asyncio.sleep(0.1)
+        return None
+
+    async def _sleep_unless_stopped(self, seconds: float):
+        end = time.time() + seconds
+        while time.time() < end and not self._stop_event.is_set():
+            await asyncio.sleep(0.1)
+
+    def _on_connected(self):
+        if self._ever_connected:
+            self.reconnect_count += 1
+            self.last_reconnect_time = time.time()
+            logger.info("%s: reconnected to %s", self.label, self.address)
+        else:
+            logger.info("%s: connected to %s", self.label, self.address)
+        self._ever_connected    = True
+        self._stream_start      = time.time()
+        self.connected          = True
+        self.connecting         = False
+        self.reconnecting       = False
+        self.reconnect_attempts = 0
+        self.error_msg          = ""
+
+    def _on_dropped(self, reason: str):
+        self.connected              = False
+        self.reconnecting           = True
+        self.reconnect_attempts     = 0
+        self.disconnect_count      += 1
+        self.last_disconnect_time   = time.time()
+        self.last_disconnect_reason = reason
+        logger.warning("%s: link dropped (%s), reconnecting", self.label, reason)
+
+    def _on_link_lost(self, _client):
+        # bleak calls this on an OS-level disconnect (and also when we call
+        # disconnect() ourselves, which is harmless: the flag is reset per session)
+        self._link_lost = True
 
     def _on_data(self, sender, data: bytearray):
         with self._lock:
@@ -273,6 +372,11 @@ class DualIMUManager:
     @property
     def pelvis_ok(self) -> bool:
         return bool(self.imu_pelvis and self.imu_pelvis.connected and not self.imu_pelvis.stale)
+
+    @property
+    def any_active(self) -> bool:
+        """Any reader thread still running (streaming, connecting or reconnecting)."""
+        return any(r.active for r in (self.imu_trunk, self.imu_pelvis) if r)
 
 
 # ── BLE scanner helper (called from app.py) ───────────────────────────────────
