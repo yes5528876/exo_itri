@@ -11,8 +11,9 @@ import math
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from calculations import compute_all, NIOSH_LIMIT
-from database import save_record, load_records, export_summary, DB_PATH
+from calculations import compute_all, NIOSH_LIMIT, LEAN_BACK_DEG
+from database import (save_records, load_records, export_summary, DB_PATH, COLUMN_LABELS,
+                      DatabaseBusyError, DatabaseCorruptError)
 from imu_reader import DualIMUManager
 
 def scan_ble_devices(timeout: float = 5.0):
@@ -72,6 +73,11 @@ def _init_state():
         "max_fc": 0.0,
         "last_metrics": None,
         "last_auto_save": 0.0,
+        # records waiting to be written to Excel (kept while the file is locked)
+        "pending_records": [],
+        "db_error": "",
+        "db_notice": "",
+        "last_flush_try": 0.0,
         # IMU
         "imu_manager": None,
         "imu_use_real": False,
@@ -270,8 +276,11 @@ else:
     theta_raw = theta1_sim - theta2_sim
     using_real_imu = False
 
-theta_calibrated = max(0.0, theta_raw - st.session_state.theta_offset)
-metrics = compute_all(theta_calibrated, weight_kg, spring_k, condition_val, load_kg=patient_kg)
+# Signed angle (negative = leaning back): shown, recorded and fed to the formulas
+# as is; below LEAN_BACK_DEG it is highlighted on screen and in Excel.
+theta_measured = theta_raw - st.session_state.theta_offset
+leaning_back = theta_measured < LEAN_BACK_DEG
+metrics = compute_all(theta_measured, weight_kg, spring_k, condition_val, load_kg=patient_kg)
 
 # ── Main layout ──────────────────────────────────────────────────────────────
 st.markdown("# 🦴 外骨骼輔助人機介面")
@@ -279,6 +288,10 @@ imu_badge = "🟢 實體 IMU" if using_real_imu else "🟡 手動模擬"
 st.markdown(f"**受測者:** {subject_info['subject_name']} | **任務:** {task_type} | **條件:** {condition_val.upper()} | **資料來源:** {imu_badge}")
 
 # ── BLE link alerts ──────────────────────────────────────────────────────────
+# Banners live in fixed st.empty() slots created on every run. While the page
+# auto-refreshes, each run ends in st.rerun() and Streamlit never removes an
+# element a later run didn't draw, so an outdated banner must be overwritten.
+alert_slots = {"Trunk": st.empty(), "Pelvis": st.empty()}
 imu_link_down = False   # an IMU that should be streaming isn't (pauses auto-save)
 if mgr:
     alert_seen = st.session_state.setdefault("imu_alert_seen", {})
@@ -307,9 +320,46 @@ if mgr:
                 msg += "\n\n測試中的 3 秒自動儲存已暫停，重新連線後自動恢復。"
             if down_s > 30:
                 msg += "\n\n若一直連不回來：確認 IMU 有電、在藍牙範圍內，或在側邊欄按「斷」再「連」。"
-            st.error(msg, icon="📡")
+            alert_slots[imu.label].error(msg, icon="📡")
         elif imu.connected and time.time() - imu.last_reconnect_time < 5:
-            st.success(f"{name} 已重新連線，資料恢復更新。", icon="✅")
+            alert_slots[imu.label].success(f"{name} 已重新連線，資料恢復更新。", icon="✅")
+
+# ── Excel writes ─────────────────────────────────────────────────────────────
+# Records are queued, then written. If the workbook can't be written (e.g. it's
+# open in Excel) they stay queued and are retried, so nothing is lost and a file
+# problem never stops the running test.
+db_pending_slot = st.empty()   # fixed slots like alert_slots, filled in after
+db_notice_slot = st.empty()    # this run's writes
+
+
+def _flush_pending() -> list[str]:
+    """Try to write all queued records; returns their ids ([] if nothing written)."""
+    pending = st.session_state.pending_records
+    if not pending:
+        return []
+    st.session_state.last_flush_try = time.time()
+    try:
+        ids, backup = save_records(pending)
+    except DatabaseBusyError as e:
+        st.session_state.db_error = str(e)
+        return []
+    except Exception as e:   # any other file problem: keep the records, show why
+        st.session_state.db_error = f"{type(e).__name__}: {e}"
+        return []
+    pending.clear()
+    st.session_state.db_error = ""
+    if backup:
+        st.session_state.db_notice = (
+            f"原本的 {os.path.basename(DB_PATH)} 已損毀無法讀取，已改名保存為 {backup}，"
+            "並建立新檔繼續記錄。")
+    return ids
+
+
+def _record_now(m: dict) -> list[str]:
+    """Queue one record stamped with the measurement time, then try to write it."""
+    rec = dict(m, timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    st.session_state.pending_records.append((subject_info, rec))
+    return _flush_pending()
 
 # ── Control buttons ──────────────────────────────────────────────────────────
 col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
@@ -344,15 +394,20 @@ with col_b3:
 
 with col_b4:
     if st.button("💾 儲存紀錄"):
-        m = metrics.copy()
-        m["theta_deg"] = round(theta_calibrated, 2)
-        rid = save_record(subject_info, m)
-        st.success(f"已儲存 — 紀錄編號: {rid}")
+        ids = _record_now(metrics)
+        if ids:
+            st.success(f"已儲存 — 紀錄編號: {ids[-1]}")
+        else:
+            st.toast("Excel 暫時無法寫入，這筆紀錄已暫存，會自動重試。", icon="💾")
 
 with col_b5:
     if st.button("📊 匯出報表"):
-        path = export_summary()
-        st.success(f"報表已匯出: `{path}`")
+        _flush_pending()   # include any queued records in the summary
+        try:
+            path = export_summary()
+            st.success(f"報表已匯出: `{path}`")
+        except Exception as e:
+            st.warning(f"報表匯出失敗：{e}")
 
 st.divider()
 
@@ -362,7 +417,6 @@ if st.session_state.testing:
 
     # Always update last_metrics while testing
     st.session_state.last_metrics = metrics.copy()
-    st.session_state.last_metrics["theta_deg"] = round(theta_calibrated, 2)
 
     # Update session stats
     f_c_current = metrics["F_c_exo"] if condition_val == "exo" else metrics["F_c_bare"]
@@ -372,9 +426,20 @@ if st.session_state.testing:
     # Auto-save every 3 seconds; paused while an IMU link is down so a dropped
     # IMU's frozen angle is not recorded as real data
     if now - st.session_state.last_auto_save >= 3.0 and not imu_link_down:
-        save_record(subject_info, st.session_state.last_metrics)
+        _record_now(st.session_state.last_metrics)
         st.session_state.last_auto_save = now
         st.session_state.high_risk_count += 1
+
+# Retry queued records every 3 s (also covers a failed manual save outside a test)
+if (st.session_state.pending_records
+        and time.time() - st.session_state.last_flush_try >= 3.0):
+    _flush_pending()
+
+if st.session_state.pending_records:
+    db_pending_slot.warning(f"💾 有 {len(st.session_state.pending_records)} 筆紀錄還沒寫進 Excel："
+                            f"{st.session_state.db_error}。紀錄已暫存、會自動重試，請先不要關閉程式。")
+if st.session_state.db_notice:
+    db_notice_slot.warning(st.session_state.db_notice)
 
 # ── Live IMU Angle Display ───────────────────────────────────────────────────
 if st.session_state.imu_use_real and mgr:
@@ -432,7 +497,10 @@ def _card(col, label, value, unit, color="#e8f0fe"):
       <div class="metric-unit">{unit}</div>
     </div>""", unsafe_allow_html=True)
 
-_card(c1, "軀幹前傾角", f"{theta_calibrated:.1f}", "°", "#4fc3f7")
+# "+ 0.0" turns a rounded -0.0 into 0.0
+_card(c1, "軀幹前傾角", f"{round(theta_measured, 1) + 0.0:.1f}",
+      "°　後仰" if leaning_back else "°",
+      "#ff9f43" if leaning_back else "#4fc3f7")
 _card(c2, "未穿戴腰椎壓迫力 F_c_bare", f"{metrics['F_c_bare']:.0f}", "N")
 _card(c3, "穿戴腰椎壓迫力 F_c_exo", f"{metrics['F_c_exo']:.0f}", "N", "#80cbc4")
 _card(c4, "外骨骼有效率", f"{metrics['reduction_percent']:.1f}", "%", "#a5d6a7")
@@ -465,7 +533,7 @@ _card(c13, "校正狀態", "已校正 ✔" if st.session_state.calibrated else "
 st.divider()
 st.markdown('<div class="section-title">📈 負載指數儀表板</div>', unsafe_allow_html=True)
 li = metrics["load_index"]
-li_pct = min(li / 1.5 * 100, 100)
+li_pct = max(0.0, min(li / 1.5 * 100, 100))   # LI goes negative when leaning back far
 
 st.markdown(f"""
 <div style="background:#1e2736;border-radius:12px;padding:16px;">
@@ -496,7 +564,15 @@ elif st.session_state.testing:
 st.divider()
 st.markdown('<div class="section-title">📋 歷史紀錄</div>', unsafe_allow_html=True)
 
-records = load_records()
+hist_slot, hist_caption_slot = st.empty(), st.empty()   # fixed slots (see alert_slots)
+try:
+    records = load_records()
+except DatabaseCorruptError as e:
+    records = None
+    hist_slot.warning(f"歷史紀錄無法讀取：{e}。下次儲存時會自動把舊檔改名備份並建立新檔。")
+except Exception as e:   # locked or being saved by another program: skip this refresh
+    records = None
+    hist_slot.warning(f"歷史紀錄暫時無法讀取：{e}")
 if records:
     df = pd.DataFrame(records)
     # Colour risk column
@@ -506,15 +582,24 @@ if records:
                   "normal": "background-color:#70ad47;color:white"}
         return colors.get(val, "")
 
+    def style_lean(val):
+        try:
+            leaning = float(val) < LEAN_BACK_DEG
+        except (TypeError, ValueError):    # blank or non-numeric cell
+            leaning = False
+        return "background-color:#BDD7EE;color:#1F3864" if leaning else ""
+
     risk_col = "風險等級" if "風險等級" in df.columns else "risk_flag"
-    st.dataframe(
-        df.style.map(style_risk, subset=[risk_col]) if risk_col in df.columns else df,
-        use_container_width=True,
-        height=300,
-    )
-    st.caption(f"共 {len(df)} 筆紀錄 | 資料庫: {DB_PATH}")
-else:
-    st.info("尚無歷史紀錄")
+    lean_col = COLUMN_LABELS["theta_deg"]
+    styler = df.style
+    if risk_col in df.columns:
+        styler = styler.map(style_risk, subset=[risk_col])
+    if lean_col in df.columns:
+        styler = styler.map(style_lean, subset=[lean_col])
+    hist_slot.dataframe(styler, use_container_width=True, height=300)
+    hist_caption_slot.caption(f"共 {len(df)} 筆紀錄 | 資料庫: {DB_PATH}")
+elif records is not None:
+    hist_slot.info("尚無歷史紀錄")
 
 # ── Auto-refresh while testing, connecting, or IMU live ───────────────────────
 if st.session_state.testing:
@@ -526,4 +611,8 @@ elif st.session_state.imu_connecting:
 elif st.session_state.imu_use_real and mgr and mgr.any_active:
     # keep polling even when data stalls, so a dropped link shows up on screen
     time.sleep(0.3)
+    st.rerun()
+elif st.session_state.pending_records:
+    # keep retrying queued Excel writes even when nothing else refreshes the page
+    time.sleep(1.0)
     st.rerun()
