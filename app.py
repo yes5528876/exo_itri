@@ -84,6 +84,26 @@ def _init_state():
 
 _init_state()
 
+# Editing imu_reader.py while the app runs reloads that module, but session_state
+# still holds readers of the old class: stop them (and any test relying on them).
+if (st.session_state.imu_manager is not None
+        and not isinstance(st.session_state.imu_manager, DualIMUManager)):
+    st.session_state.imu_manager.disconnect()
+    st.session_state.imu_manager = None
+    st.session_state.imu_use_real = False
+    st.session_state.testing = False
+    st.warning("IMU 程式已更新，測試已停止，請重新連線 IMU。")
+
+IMU_NAMES = {"Trunk": "IMU1（軀幹）", "Pelvis": "IMU2（骨盆）"}
+
+
+def _drop_history(imu) -> str:
+    """Sidebar suffix summarising past link drops of a connected IMU."""
+    if not imu.disconnect_count:
+        return ""
+    last = datetime.fromtimestamp(imu.last_disconnect_time).strftime("%H:%M:%S")
+    return f"（曾斷線 {imu.disconnect_count} 次，最近 {last}）"
+
 # ── Sidebar: Subject info ────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🧑 受測者資料")
@@ -121,6 +141,7 @@ with st.sidebar:
     imu1 = mgr.imu_trunk if mgr else None
     imu1_connected = imu1 and imu1.connected
     imu1_connecting = imu1 and imu1.connecting
+    imu1_reconnecting = imu1 and imu1.reconnecting
 
     c1a, c1b = st.columns(2)
     with c1a:
@@ -129,15 +150,16 @@ with st.sidebar:
                 mgr = DualIMUManager()
                 st.session_state.imu_manager = mgr
                 st.session_state.imu_use_real = True
-            if imu1_connected:
-                mgr.imu_trunk.stop()
+            if mgr.imu_trunk:
+                mgr.imu_trunk.stop()   # also ends an auto-reconnect loop
             from imu_reader import IMUReader
             mgr.imu_trunk = IMUReader(addr_trunk.strip(), label="Trunk")
             mgr.imu_trunk.start_async()
             st.session_state.imu_connecting = True
             st.rerun()
     with c1b:
-        if st.button("✖ 斷 IMU1", use_container_width=True, disabled=not imu1_connected):
+        # stays enabled while reconnecting, so an endless retry can be stopped
+        if st.button("✖ 斷 IMU1", use_container_width=True, disabled=imu1 is None):
             if mgr and mgr.imu_trunk:
                 mgr.imu_trunk.stop()
                 mgr.imu_trunk = None
@@ -145,10 +167,12 @@ with st.sidebar:
 
     if imu1_connecting:
         st.caption("⏳ IMU1 連線中…")
+    elif imu1_reconnecting:
+        st.caption("🟠 IMU1 斷線，自動重連中…")
     elif imu1 and imu1.error_msg:
         st.caption(f"🔴 IMU1 錯誤: {imu1.error_msg[:60]}")
     elif imu1_connected:
-        st.caption("🟢 IMU1 已連線")
+        st.caption("🟢 IMU1 已連線" + _drop_history(imu1))
     else:
         st.caption("⚪ IMU1 未連線")
 
@@ -163,6 +187,7 @@ with st.sidebar:
     imu2 = mgr.imu_pelvis if mgr else None
     imu2_connected = imu2 and imu2.connected
     imu2_connecting = imu2 and imu2.connecting
+    imu2_reconnecting = imu2 and imu2.reconnecting
 
     c2a, c2b = st.columns(2)
     with c2a:
@@ -171,15 +196,15 @@ with st.sidebar:
                 mgr = DualIMUManager()
                 st.session_state.imu_manager = mgr
                 st.session_state.imu_use_real = True
-            if imu2_connected:
-                mgr.imu_pelvis.stop()
+            if mgr.imu_pelvis:
+                mgr.imu_pelvis.stop()   # also ends an auto-reconnect loop
             from imu_reader import IMUReader
             mgr.imu_pelvis = IMUReader(addr_pelvis.strip(), label="Pelvis")
             mgr.imu_pelvis.start_async()
             st.session_state.imu_connecting = True
             st.rerun()
     with c2b:
-        if st.button("✖ 斷 IMU2", use_container_width=True, disabled=not imu2_connected):
+        if st.button("✖ 斷 IMU2", use_container_width=True, disabled=imu2 is None):
             if mgr and mgr.imu_pelvis:
                 mgr.imu_pelvis.stop()
                 mgr.imu_pelvis = None
@@ -187,15 +212,19 @@ with st.sidebar:
 
     if imu2_connecting:
         st.caption("⏳ IMU2 連線中…")
+    elif imu2_reconnecting:
+        st.caption("🟠 IMU2 斷線，自動重連中…")
     elif imu2 and imu2.error_msg:
         st.caption(f"🔴 IMU2 錯誤: {imu2.error_msg[:60]}")
     elif imu2_connected:
-        st.caption("🟢 IMU2 已連線")
+        st.caption("🟢 IMU2 已連線" + _drop_history(imu2))
     else:
         st.caption("⚪ IMU2 未連線（θ2 = 0°）")
 
     # update global connecting flag
-    st.session_state.imu_connecting = bool(imu1_connecting or imu2_connecting)
+    # (re)connecting drives the 1 s refresh at the bottom of the page
+    st.session_state.imu_connecting = bool(imu1_connecting or imu2_connecting
+                                           or imu1_reconnecting or imu2_reconnecting)
     if mgr and (imu1_connected or imu2_connected):
         st.session_state.imu_use_real = True
 
@@ -248,6 +277,39 @@ metrics = compute_all(theta_calibrated, weight_kg, spring_k, condition_val, load
 st.markdown("# 🦴 外骨骼輔助人機介面")
 imu_badge = "🟢 實體 IMU" if using_real_imu else "🟡 手動模擬"
 st.markdown(f"**受測者:** {subject_info['subject_name']} | **任務:** {task_type} | **條件:** {condition_val.upper()} | **資料來源:** {imu_badge}")
+
+# ── BLE link alerts ──────────────────────────────────────────────────────────
+imu_link_down = False   # an IMU that should be streaming isn't (pauses auto-save)
+if mgr:
+    alert_seen = st.session_state.setdefault("imu_alert_seen", {})
+    for imu in (mgr.imu_trunk, mgr.imu_pelvis):
+        if imu is None:
+            continue
+        name = IMU_NAMES.get(imu.label, imu.label)
+
+        # pop-up once per new drop / recovery (event timestamps only move forward)
+        seen = alert_seen.get(imu.label, 0.0)
+        if imu.last_disconnect_time > seen:
+            st.toast(f"{name} 藍牙斷線，正在自動重連…", icon="⚠️")
+        if imu.last_reconnect_time > seen:
+            st.toast(f"{name} 已重新連線", icon="✅")
+        alert_seen[imu.label] = max(seen, imu.last_disconnect_time, imu.last_reconnect_time)
+
+        if imu.reconnecting or (imu.connected and imu.stale):
+            imu_link_down = True
+
+        if imu.reconnecting:
+            down_s = time.time() - imu.last_disconnect_time
+            attempt = f"，第 {imu.reconnect_attempts} 次嘗試" if imu.reconnect_attempts else ""
+            msg = (f"**{name} 藍牙斷線**，正在自動重連…（已斷線 {down_s:.0f} 秒{attempt}）"
+                   f"　原因：{imu.last_disconnect_reason}")
+            if st.session_state.testing:
+                msg += "\n\n測試中的 3 秒自動儲存已暫停，重新連線後自動恢復。"
+            if down_s > 30:
+                msg += "\n\n若一直連不回來：確認 IMU 有電、在藍牙範圍內，或在側邊欄按「斷」再「連」。"
+            st.error(msg, icon="📡")
+        elif imu.connected and time.time() - imu.last_reconnect_time < 5:
+            st.success(f"{name} 已重新連線，資料恢復更新。", icon="✅")
 
 # ── Control buttons ──────────────────────────────────────────────────────────
 col_b1, col_b2, col_b3, col_b4, col_b5 = st.columns(5)
@@ -307,8 +369,9 @@ if st.session_state.testing:
     if f_c_current > st.session_state.max_fc:
         st.session_state.max_fc = f_c_current
 
-    # Auto-save every 3 seconds
-    if now - st.session_state.last_auto_save >= 3.0:
+    # Auto-save every 3 seconds; paused while an IMU link is down so a dropped
+    # IMU's frozen angle is not recorded as real data
+    if now - st.session_state.last_auto_save >= 3.0 and not imu_link_down:
         save_record(subject_info, st.session_state.last_metrics)
         st.session_state.last_auto_save = now
         st.session_state.high_risk_count += 1
@@ -336,9 +399,14 @@ if st.session_state.imu_use_real and mgr:
     _imu_card(ci2, "IMU1 Pitch", f"{imu1.pitch:.1f}°" if ok1 else "—", ok1)
     _imu_card(ci3, "IMU1 Yaw",   f"{imu1.yaw:.1f}°"   if ok1 else "—", ok1)
 
+    def _dot(imu, idle):
+        if imu is not None and imu.reconnecting:
+            return "🟠"
+        return "🟢" if imu is not None and imu.connected else idle
+
     ci4.markdown(f"""
     <div class="metric-card" style="padding-top:28px;">
-      <div class="metric-value" style="color:#555;font-size:20px;">{'🟢' if ok1 else '🔴'} IMU1<br>{'🟢' if ok2 else '⚪'} IMU2</div>
+      <div class="metric-value" style="color:#555;font-size:20px;">{_dot(imu1, '🔴')} IMU1<br>{_dot(imu2, '⚪')} IMU2</div>
     </div>""", unsafe_allow_html=True)
 
     _imu_card(ci5, "IMU2 Roll",  f"{imu2.roll:.1f}°"  if ok2 else "—", ok2)
@@ -417,7 +485,9 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ── Testing status hint ──────────────────────────────────────────────────────
-if st.session_state.testing:
+if st.session_state.testing and imu_link_down:
+    st.warning("⏸ 測試進行中 — IMU 斷線，自動儲存暫停中，重新連線後恢復")
+elif st.session_state.testing:
     elapsed_since_save = time.time() - st.session_state.last_auto_save
     next_save = max(0, 3.0 - elapsed_since_save)
     st.info(f"⏱ 測試進行中 — 下次自動儲存: {next_save:.1f} 秒")
@@ -453,6 +523,7 @@ if st.session_state.testing:
 elif st.session_state.imu_connecting:
     time.sleep(1.0)
     st.rerun()
-elif st.session_state.imu_use_real and mgr and (mgr.trunk_ok or mgr.pelvis_ok):
+elif st.session_state.imu_use_real and mgr and mgr.any_active:
+    # keep polling even when data stalls, so a dropped link shows up on screen
     time.sleep(0.3)
     st.rerun()
